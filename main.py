@@ -2,9 +2,8 @@ import streamlit as st
 from openai import OpenAI
 import PyPDF2
 import docx
-import difflib
-import html
 import re
+import textwrap
 
 # ------------- Text Extraction Utilities -------------
 
@@ -12,7 +11,6 @@ def extract_text_from_pdf(pdf_file):
     pdf_reader = PyPDF2.PdfReader(pdf_file)
     text = ""
     for page in pdf_reader.pages:
-        # Some PDFs may return None for extract_text()
         page_text = page.extract_text() or ""
         text += page_text + "\n"
     return text
@@ -25,7 +23,6 @@ def extract_text_from_docx(docx_file):
     return text
 
 def extract_text_from_txt(txt_file):
-    # Handle both bytes and str streams
     content = txt_file.read()
     if isinstance(content, bytes):
         return content.decode("utf-8", errors="replace")
@@ -44,7 +41,59 @@ def get_document_text(uploaded_file):
         st.error("Unsupported file type. Please upload PDF, DOCX, or TXT files.")
         return None
 
-# ------------- AI Analysis -------------
+# ------------- Normalization for Content-only Compare -------------
+
+def normalize_content(text: str) -> str:
+    """
+    Normalize text to focus on content, not styling/formatting.
+    - Normalize newlines and whitespace
+    - Collapse multiple spaces
+    - Remove common header/footer noise patterns (best effort)
+    - Keep punctuation and sentence boundaries
+    """
+    if not text:
+        return ""
+    # Normalize line endings
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Remove obvious page headers/footers if repetitive lines appear > 5 times
+    lines = [ln.strip() for ln in t.split("\n")]
+    freq = {}
+    for ln in lines:
+        if not ln:
+            continue
+        freq[ln] = freq.get(ln, 0) + 1
+    common_noise = {ln for ln, c in freq.items() if c >= 5 and len(ln) <= 80}
+    lines = [ln for ln in lines if ln not in common_noise]
+    t = "\n".join(lines)
+    # Collapse excessive whitespace
+    t = re.sub(r"[ \t]+", " ", t)
+    # Collapse multiple blank lines
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    # Trim
+    t = t.strip()
+    return t
+
+def chunk_text(s: str, max_chars: int = 6000):
+    """
+    Chunk text on paragraph boundaries to stay within model limits.
+    """
+    if len(s) <= max_chars:
+        return [s]
+    paras = s.split("\n\n")
+    chunks, cur, cur_len = [], [], 0
+    for p in paras:
+        if cur_len + len(p) + 2 <= max_chars:
+            cur.append(p)
+            cur_len += len(p) + 2
+        else:
+            chunks.append("\n\n".join(cur))
+            cur = [p]
+            cur_len = len(p) + 2
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+# ------------- LLM: Approval Analysis (original) -------------
 
 def analyze_document_approval(client, circular_text, proposal_text):
     prompt = f"""
@@ -88,197 +137,136 @@ def analyze_document_approval(client, circular_text, proposal_text):
     except Exception as e:
         return f"Error analyzing documents: {str(e)}"
 
-# ------------- Diff Utilities -------------
+# ------------- LLM: Content Comparison with Reasoning -------------
 
-def normalize_newlines(text: str) -> str:
-    # Convert Windows/Mac newlines to \n
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-def tokenize_words(s: str):
-    # Simple word tokenizer that keeps punctuation as separate tokens
-    return re.findall(r"\w+|[^\w\s]", s, re.UNICODE)
-
-def word_level_diff(a_line: str, b_line: str) -> str:
+def llm_content_compare(client, doc1_norm: str, doc2_norm: str):
     """
-    Return an HTML string where deletions are wrapped in <del> and insertions in <ins>.
-    This is for a single line comparison at word level.
+    Compare content semantically, ignoring styling/formatting. Provide reasoned report.
+    If texts are long, summarize chunks then provide a global judgment.
     """
-    a_tokens = tokenize_words(a_line)
-    b_tokens = tokenize_words(b_line)
-    sm = difflib.SequenceMatcher(a=a_tokens, b=b_tokens)
-    out = []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            segment = "".join(html.escape(tok) for tok in a_tokens[i1:i2])
-            out.append(segment)
-        elif tag == "delete":
-            segment = "".join(html.escape(tok) for tok in a_tokens[i1:i2])
-            out.append(f'<del style="background:#ffe0e0;text-decoration:line-through;color:#b30000">{segment}</del>')
-        elif tag == "insert":
-            segment = "".join(html.escape(tok) for tok in b_tokens[j1:j2])
-            out.append(f'<ins style="background:#e0ffe6;text-decoration:none;color:#006600">{segment}</ins>')
-        elif tag == "replace":
-            del_seg = "".join(html.escape(tok) for tok in a_tokens[i1:i2])
-            ins_seg = "".join(html.escape(tok) for tok in b_tokens[j1:j2])
-            out.append(f'<del style="background:#ffe0e0;text-decoration:line-through;color:#b30000">{del_seg}</del>')
-            out.append(f'<ins style="background:#e0ffe6;text-decoration:none;color:#006600">{ins_seg}</ins>')
-    # Join and also preserve spaces between tokens where appropriate
-    # Our tokenizer removed spaces; insert a space between alphanumerics and punctuation if needed is tricky.
-    # To keep it simple, we will display tokens back-to-back; this is generally readable for highlighting.
-    return "".join(out)
+    # Chunk if needed
+    c1 = chunk_text(doc1_norm, max_chars=6000)
+    c2 = chunk_text(doc2_norm, max_chars=6000)
 
-def side_by_side_diff(text1: str, text2: str) -> str:
-    """
-    Build a side-by-side HTML diff of two texts line-by-line.
-    Uses word-level highlighting for modified lines.
-    """
-    text1 = normalize_newlines(text1)
-    text2 = normalize_newlines(text2)
-    lines1 = text1.split("\n")
-    lines2 = text2.split("\n")
+    # If single-chunk each, do a direct compare
+    if len(c1) == 1 and len(c2) == 1:
+        return _llm_direct_compare(client, c1[0], c2[0])
 
-    sm = difflib.SequenceMatcher(a=lines1, b=lines2)
+    # Otherwise, compare chunk pairs and then ask the model for an overall synthesis
+    per_chunk_results = []
+    for i in range(max(len(c1), len(c2))):
+        t1 = c1[i] if i < len(c1) else ""
+        t2 = c2[i] if i < len(c2) else ""
+        res = _llm_direct_compare(client, t1, t2, section_label=f"Section {i+1}")
+        per_chunk_results.append(res)
 
-    # Build rows
-    rows = []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            for k in range(i1, i2):
-                left = html.escape(lines1[k])
-                right = html.escape(lines2[j1 + (k - i1)])
-                rows.append((
-                    "equal",
-                    left,
-                    right
-                ))
-        elif tag in ("replace", "delete", "insert"):
-            # Handle line changes
-            left_block = lines1[i1:i2]
-            right_block = lines2[j1:j2]
-            max_len = max(len(left_block), len(right_block))
-            for idx in range(max_len):
-                left_line = left_block[idx] if idx < len(left_block) else ""
-                right_line = right_block[idx] if idx < len(right_block) else ""
-                if left_line == right_line:
-                    rows.append(("equal", html.escape(left_line), html.escape(right_line)))
-                else:
-                    # Word-level highlight
-                    highlighted = word_level_diff(left_line, right_line)
-                    # For left and right columns, split the highlighted string into del/ins dominant views
-                    # Simpler: show both changes in both columns but with background to indicate side
-                    left_view = highlighted
-                    right_view = highlighted
-                    rows.append(("change", left_view, right_view))
+    synthesis_prompt = f"""
+You are comparing two long documents in multiple sections. Below are per-section comparison reports. Produce a single final report that:
+- Judges whether the documents are identical in meaning, have only minor editorial differences, or contain substantive differences.
+- Explains the key differences with solid reasoning.
+- Lists examples/quotes (short snippets) to illustrate differences (if any).
+- Ignores styling, typography, fonts, and minor formatting.
 
-    # Build HTML table
-    table_css = """
-    <style>
-    .diff-table {
-        width: 100%;
-        border-collapse: collapse;
-        table-layout: fixed;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        font-size: 13px;
-    }
-    .diff-table th, .diff-table td {
-        border: 1px solid #e5e7eb;
-        vertical-align: top;
-        padding: 6px 8px;
-        white-space: pre-wrap;
-        word-wrap: break-word;
-    }
-    .diff-equal { background: #ffffff; }
-    .diff-change { background: #fffbea; }
-    .diff-header {
-        background: #f3f4f6;
-        font-weight: 600;
-        text-align: left;
-    }
-    .cell-index {
-        width: 60px;
-        color: #6b7280;
-        background: #f9fafb;
-        text-align: right;
-        padding-right: 8px;
-    }
-    .cell-content {
-        width: calc(50% - 60px);
-    }
-    del { text-decoration: line-through; }
-    ins { text-decoration: none; }
-    </style>
-    """
+Possible Decision values:
+- "IDENTICAL IN MEANING"
+- "MINOR EDITS ONLY"
+- "SUBSTANTIVE DIFFERENCES"
 
-    # Build table rows with line numbers
-    html_rows = []
-    left_line_no = 1
-    right_line_no = 1
+Per-section results:
+{"\n\n".join(per_chunk_results)}
 
-    for kind, left_html, right_html in rows:
-        row_class = "diff-equal" if kind == "equal" else "diff-change"
-        # increment line numbers based on presence of content
-        left_num = left_line_no if left_html != "" else ""
-        right_num = right_line_no if right_html != "" else ""
-        if left_html != "":
-            left_line_no += 1
-        if right_html != "":
-            right_line_no += 1
+Respond in this exact format:
+Decision: <one of the three values>
 
-        html_rows.append(f"""
-        <tr class="{row_class}">
-            <td class="cell-index">{left_num}</td>
-            <td class="cell-content">{left_html}</td>
-            <td class="cell-index">{right_num}</td>
-            <td class="cell-content">{right_html}</td>
-        </tr>
-        """)
+Reasoning:
+- <bullet 1>
+- <bullet 2>
+- <bullet 3>
 
-    table = f"""
-    {table_css}
-    <table class="diff-table">
-        <thead>
-            <tr class="diff-header">
-                <th>#</th>
-                <th>Document 1</th>
-                <th>#</th>
-                <th>Document 2</th>
-            </tr>
-        </thead>
-        <tbody>
-            {''.join(html_rows)}
-        </tbody>
-    </table>
-    """
-    return table
+Key Differences (if any):
+- <brief example or snippet and what changed>
 
-def quick_equality_stats(text1: str, text2: str):
-    # Basic stats for quick glance
-    same = text1 == text2
-    return {
-        "exact_match": same,
-        "len_doc1_chars": len(text1),
-        "len_doc2_chars": len(text2),
-        "len_doc1_words": len(text1.split()),
-        "len_doc2_words": len(text2.split()),
-    }
+Recommendations (if any):
+- <how to align them or what to change>
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a rigorous content-comparison expert. Focus only on meaning, not styling or formatting."},
+                {"role": "user", "content": synthesis_prompt}
+            ],
+            max_tokens=800,
+            temperature=0.1,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error during content comparison synthesis: {str(e)}"
+
+def _llm_direct_compare(client, t1: str, t2: str, section_label: str = None):
+    section = f" ({section_label})" if section_label else ""
+    prompt = f"""
+Compare the content of two texts{section}. Focus only on meaning/semantics and substantive requirements. Ignore fonts, styles, headings, numbering changes, and superficial formatting.
+
+Text A:
+{t1}
+
+Text B:
+{t2}
+
+Tasks:
+1) Determine if Text B has the same meaning as Text A.
+2) If there are differences, classify them as MINOR EDITS (wording/grammar/ordering with preserved meaning) or SUBSTANTIVE DIFFERENCES (policy, scope, conditions, figures, dates, obligations change).
+3) Provide solid reasoning with specific references (short quotes or paraphrases). Keep it concise but concrete.
+
+Respond in this exact format:
+Decision: IDENTICAL IN MEANING / MINOR EDITS ONLY / SUBSTANTIVE DIFFERENCES
+
+Reasoning:
+- <bullet points with evidence>
+
+Key Differences (if any):
+- <short snippet or paraphrase comparison>
+
+Recommendations (if any):
+- <how to align B to A if needed>
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a rigorous content-comparison expert. Focus only on meaning, not styling or formatting."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=800,
+            temperature=0.1,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error during content comparison: {str(e)}"
 
 # ------------- Streamlit App -------------
 
 def main():
     st.set_page_config(
-        page_title="Proposal Approval Analyzer + Document Compare",
+        page_title="Proposal Approval Analyzer + Content Comparator (LLM)",
         page_icon="✅",
         layout="wide"
     )
-    st.title("✅ Proposal Approval Analyzer + 🔎 Document Comparator")
-    st.markdown("Upload a circular and a proposal for approval analysis, or compare two documents and highlight differences.")
+    st.title("✅ Proposal Approval Analyzer + 🧠 Content Comparator (LLM)")
+    st.markdown("Upload two documents. Choose Approval Analysis or Content-only Comparison powered by LLM reasoning.")
 
     # Sidebar mode selection
-    mode = st.sidebar.radio("Select Mode", ["Approval Analyzer", "Compare Documents"], index=0)
+    mode = st.sidebar.radio(
+        "Select Mode",
+        ["Approval Analyzer", "Content Compare (LLM)"],
+        index=0
+    )
 
-    # Get API key from Streamlit secrets (user never sees this)
+    # API key only needed when an LLM mode is used
+    needs_llm = True  # both modes use LLM here
     client = None
-    if mode == "Approval Analyzer":
+    if needs_llm:
         if "openai" not in st.secrets or "api_key" not in st.secrets["openai"]:
             st.error("AI API key not found in app configuration. Please contact the administrator.")
             st.stop()
@@ -292,7 +280,6 @@ def main():
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("📋 Document 1")
-        st.caption("Upload the first document (e.g., circular/policy)")
         doc1_file = st.file_uploader(
             "Upload Document 1",
             type=['pdf', 'docx', 'txt'],
@@ -303,7 +290,6 @@ def main():
     
     with col2:
         st.subheader("📄 Document 2")
-        st.caption("Upload the second document (e.g., proposal or revised version)")
         doc2_file = st.file_uploader(
             "Upload Document 2",
             type=['pdf', 'docx', 'txt'],
@@ -314,27 +300,31 @@ def main():
 
     if doc1_file and doc2_file:
         with st.spinner("Extracting text from documents..."):
-            doc1_text = get_document_text(doc1_file)
-            doc2_text = get_document_text(doc2_file)
+            doc1_text_raw = get_document_text(doc1_file)
+            doc2_text_raw = get_document_text(doc2_file)
 
-        if not doc1_text or not doc2_text:
+        if not doc1_text_raw or not doc2_text_raw:
             st.error("Failed to extract text from one or both documents.")
             return
 
         # Previews
-        with st.expander("📖 Document Previews"):
+        with st.expander("📖 Document Previews (raw extracted text)"):
             c1, c2 = st.columns(2)
             with c1:
-                st.subheader("Document 1 Preview")
-                st.text_area("", (doc1_text[:1000] + ("..." if len(doc1_text) > 1000 else "")), height=220, disabled=True)
+                st.subheader("Document 1")
+                st.text_area("", doc1_text_raw[:1500] + ("..." if len(doc1_text_raw) > 1500 else ""), height=220, disabled=True)
             with c2:
-                st.subheader("Document 2 Preview")
-                st.text_area("", (doc2_text[:1000] + ("..." if len(doc2_text) > 1000 else "")), height=220, disabled=True)
+                st.subheader("Document 2")
+                st.text_area("", doc2_text_raw[:1500] + ("..." if len(doc2_text_raw) > 1500 else ""), height=220, disabled=True)
+
+        # Normalized versions for content-only compare
+        doc1_norm = normalize_content(doc1_text_raw)
+        doc2_norm = normalize_content(doc2_text_raw)
 
         if mode == "Approval Analyzer":
             if st.button("🔍 Analyze Proposal for Approval", type="primary"):
                 with st.spinner("Analyzing proposal against circular requirements..."):
-                    analysis_result = analyze_document_approval(client, doc1_text, doc2_text)
+                    analysis_result = analyze_document_approval(client, doc1_norm, doc2_norm)
                 st.subheader("🎯 Approval Decision")
                 if "APPROVED" in analysis_result.upper():
                     st.success("✅ PROPOSAL APPROVED")
@@ -345,51 +335,43 @@ def main():
                 st.subheader("📊 Document Statistics")
                 colA, colB, colC, colD = st.columns(4)
                 with colA:
-                    st.metric("Doc1 Length", f"{len(doc1_text.split())} words")
+                    st.metric("Doc1 Words (normalized)", f"{len(doc1_norm.split())}")
                 with colB:
-                    st.metric("Doc2 Length", f"{len(doc2_text.split())} words")
+                    st.metric("Doc2 Words (normalized)", f"{len(doc2_norm.split())}")
                 with colC:
-                    st.metric("Doc1 Characters", f"{len(doc1_text):,}")
+                    st.metric("Doc1 Characters", f"{len(doc1_norm):,}")
                 with colD:
-                    st.metric("Doc2 Characters", f"{len(doc2_text):,}")
+                    st.metric("Doc2 Characters", f"{len(doc2_norm):,}")
 
-        else:  # Compare Documents
-            st.subheader("🧮 Quick Comparison")
-            stats = quick_equality_stats(doc1_text, doc2_text)
-            if stats["exact_match"]:
-                st.success("✅ Documents are EXACTLY identical.")
-            else:
-                st.warning("⚠️ Documents differ.")
+        else:  # Content Compare (LLM)
+            if st.button("🧠 Compare Content (LLM)", type="primary"):
+                with st.spinner("Comparing content with LLM (ignoring styling/formatting)..."):
+                    result = llm_content_compare(client, doc1_norm, doc2_norm)
 
-            colA, colB, colC, colD = st.columns(4)
-            with colA:
-                st.metric("Doc1 Words", f"{stats['len_doc1_words']}")
-            with colB:
-                st.metric("Doc2 Words", f"{stats['len_doc2_words']}")
-            with colC:
-                st.metric("Doc1 Chars", f"{stats['len_doc1_chars']:,}")
-            with colD:
-                st.metric("Doc2 Chars", f"{stats['len_doc2_chars']:,}")
+                st.subheader("🧾 LLM Content Comparison Result")
+                st.markdown(result)
 
-            st.subheader("🧩 Differences (Side-by-Side)")
-            st.caption("Green = insertions; Red strikethrough = deletions. Yellow rows indicate changed lines.")
-            diff_html = side_by_side_diff(doc1_text, doc2_text)
-            st.components.v1.html(diff_html, height=600, scrolling=True)
+                # Quick verdict badge derived from Decision line
+                decision_line = next((ln for ln in result.splitlines() if ln.strip().lower().startswith("decision:")), "")
+                decision = decision_line.split(":", 1)[1].strip() if ":" in decision_line else ""
+                if "IDENTICAL" in decision.upper():
+                    st.success("✅ Identical in meaning")
+                elif "MINOR" in decision.upper():
+                    st.info("ℹ️ Minor edits only")
+                elif "SUBSTANTIVE" in decision.upper():
+                    st.warning("⚠️ Substantive differences")
+                else:
+                    st.info("Comparison complete")
 
-    with st.expander("ℹ️ How to use"):
+    with st.expander("ℹ️ Notes"):
         st.markdown("""
-        1. Upload Document 1 and Document 2.
-        2. Select the desired mode from the sidebar:
-           - Approval Analyzer: Decide if Document 2 (proposal) can be approved based on Document 1 (circular).
-           - Compare Documents: Check if both documents are the same and view highlighted differences.
-        3. Click the action button to run the selected operation.
-        
-        What happens:
-        - Approval Analyzer compares proposal against circular and returns APPROVED/REJECTED with reasoning.
-        - Compare Documents provides equality status, basic stats, and a side-by-side diff with highlights.
+        - Content-only comparison ignores fonts, typography, and superficial formatting.
+        - We normalize whitespace and remove repetitive headers/footers where possible.
+        - For very long documents, the app compares in sections, then synthesizes a global judgment.
+        - If your PDFs are scans without selectable text, OCR is required (not included here).
         """)
 
-    st.markdown("Built by SLEEKY @ BSPL AI Team | Proposal Approval Analyzer + Comparator")
+    st.markdown("Built by SLEEKY @ BSPL AI Team | Content-first Comparison")
 
 if __name__ == "__main__":
     main()
